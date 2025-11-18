@@ -1,0 +1,280 @@
+---
+title: "datafest"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(stringr)
+afford_df <- read_csv("cost_of_living_us.csv") #2024
+
+environment_df <- read_csv("Eqi_results_2013JULY22.csv") |> 
+  mutate(
+    county_name = str_replace(county_name, "\\s+(c|ci|cit)$", " city"),
+    county_name = str_remove(county_name, "\\s+(County|Count|Coun|Cou|Co|C|P|Pa|Par|Pari|Paris|Parish)$"),
+    county_combined = paste(county_name, state)
+  ) |> 
+  select(county_combined, EQI_22July2013) |> 
+  rename(county = county_combined,
+         EQI = EQI_22July2013)
+
+health_df <- read_csv("U.S._Life_Expectancy_at_Birth_by_State_and_Census_Tract_-_2010-2015.csv") |> 
+  filter(County != "(blank)") |> 
+  select(County, `Life Expectancy`) |> 
+  group_by(County) |> 
+  summarize(
+    meanLifeExpectancy = mean(`Life Expectancy`, na.rm = TRUE)
+  ) |> 
+  filter(!is.na(meanLifeExpectancy)) |> 
+  separate(County, into = c("county_part", "state"), sep = ",", extra = "drop", fill = "right") |>
+  mutate(
+    county_part = str_trim(county_part),
+    state = str_trim(state)
+  ) |> 
+  mutate(
+    county_part = str_replace(county_part, "(?i)\\s+(c|ci|cit)$", " city"),
+    county_name = str_remove(county_part, "\\s+(County|Count|Coun|Cou|Co|C|P|Pa|Par|Pari|Paris|Parish)$"),
+    county = paste(county_name, state)
+  ) |> 
+  select(county, meanLifeExpectancy)
+
+economic_df <- afford_df |> 
+  filter(family_member_count == "2p2c") |> 
+  mutate(
+    county = str_replace(county, "(?i)\\s+(c|ci|cit)$", " city"),
+    county = str_remove(county, "\\s+(County|Count|Coun|Cou|Co|C|P|Pa|Par|Pari|Paris|Parish)$"),
+    county_combined = paste(county, state)
+  ) |> 
+  select(county_combined, median_family_income) |> 
+  rename(county = county_combined)
+
+corrections <- c(
+  #wrong = right
+  "Colonial Heights VA" = "Colonial Heights city VA",
+  "Mc Kean PA" = "McKean PA",
+  "DeBaca NM" = "De Baca NM",
+  "St. John the Bapt LA" = "St. John the Baptist LA",
+  "La Porte IN" = "LaPorte IN",
+  "Lagrange IN" = "LaGrange IN",
+  "De Kalb IN" = "DeKalb IN",
+  "District of Colum DC" = "District of Columbia DC",
+  "Aleutians East Bo AK" = "Aleutians East Borough AK",
+  "Aleutians West Ce AK" = "Aleutians West Census Area AK",
+  "Anchorage Borough AK" = "Anchorage Municipality AK",
+  "Bethel Census Are AK" = "Bethel Census Area AK",
+  "Bristol Bay Borou AK" = "Bristol Bay Borough AK",
+  ""
+)
+
+fixNames <- function(df, column, lookup){
+  old_values <- df[[column]]
+  needs_fix <- old_values %in% names(lookup)
+  df[[column]] <- ifelse(
+    needs_fix,
+    lookup[old_values],
+    old_values
+  )
+  return(df)
+}
+
+environment_df <- fixNames(environment_df, "county", corrections)
+
+prosperity_df <- environment_df |> 
+  left_join(economic_df, by = "county") |> 
+  left_join(health_df, by = "county") |> 
+  filter(!is.na(meanLifeExpectancy))
+
+prosperity_df <- prosperity_df |> 
+  mutate(
+    EQI_z = as.numeric(scale(EQI)),
+    income_z = as.numeric(scale(median_family_income)),
+    lifeExp_z = as.numeric(scale(meanLifeExpectancy)),
+    
+    prosperity_avg = (EQI_z + income_z + lifeExp_z) / 3,
+    
+    prosperity_score = as.numeric(scale(EQI_z + income_z + lifeExp_z))
+  )
+
+prosperity_scores <- prosperity_df |> 
+  select(county, prosperity_score)
+```
+
+```{r}
+model_df <- afford_df |> 
+  filter(family_member_count == "2p2c")  |> 
+  select(county, state, housing_cost, food_cost, transportation_cost, healthcare_cost, other_necessities_cost, childcare_cost, taxes) |> 
+  mutate(
+    county = str_replace(county, "(?i)\\s+(c|ci|cit)$", " city"),
+    county = str_remove(county, "\\s+(County|Count|Coun|Cou|Co|C|P|Pa|Par|Pari|Paris|Parish)$"),
+    county_combined = paste(county, state)
+  ) |> 
+  select(-county) |> 
+  rename(county = county_combined) |> 
+  select(county, housing_cost, food_cost, transportation_cost, healthcare_cost, other_necessities_cost, childcare_cost, taxes) |> 
+  left_join(prosperity_scores, by = "county") |> 
+  filter(!is.na(prosperity_score))
+
+write_csv(model_df, "modelData.csv")
+```
+
+```{r}
+library(MASS)
+fit <- glm(prosperity_score ~ housing_cost + food_cost + transportation_cost + healthcare_cost +
+      other_necessities_cost + childcare_cost + taxes, family = "gaussian", data = model_df)
+
+stepAIC(fit)
+
+anova(fit)
+summary(fit)
+
+library(rsq)
+rsq.partial(fit)
+
+library(car)
+vif(fit)
+
+library(glmnet)
+x <- model.matrix(prosperity_score ~ housing_cost + food_cost + transportation_cost +
+                  healthcare_cost + other_necessities_cost + childcare_cost + taxes, model_df)[,-1]
+y <- model_df$prosperity_score
+cvfit <- cv.glmnet(x, y, alpha = 0)
+plot(cvfit)
+coef(cvfit, s = "lambda.min")
+```
+
+
+XGBoost Model
+```{r}
+library(tidymodels)
+
+split <- initial_split(model_df, prop = .8)
+train <- training(split)
+test <- testing(split)
+
+rec <- train |> 
+  recipe(prosperity_score ~ .) |> 
+  step_rm(county) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_corr(all_numeric_predictors())
+
+xgb_spec <- boost_tree(
+  trees = tune(),
+  learn_rate = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune()
+  ) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+wf <- workflow() |>
+  add_model(xgb_spec) |>
+  add_recipe(rec)
+
+folds <- vfold_cv(train, v = 5)
+
+rec_prep <- prep(rec, training = train)
+train_after_recipe <- juice(rec_prep) |> select(-prosperity_score)
+
+grid <- grid_latin_hypercube(
+  trees(),
+  learn_rate(range = c(0.01, 0.3)),
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), train_after_recipe),
+  size = 30
+)
+
+tuned <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = grid,
+  metrics = metric_set(rmse, rsq),
+  control = control_grid(save_pred = TRUE)
+)
+
+best_params <- select_best(tuned, metric = "rmse")
+final_wf <- finalize_workflow(wf, best_params)
+
+final_fit <- fit(final_wf, data = train)
+
+metrics_tbl <- predict(final_fit, test) |>
+  bind_cols(test |> select(prosperity_score)) |>
+  metric_set(rmse, rsq, mae)(truth = prosperity_score, estimate = .pred) |>
+  arrange(.metric) |>
+  mutate(
+    .metric = toupper(.metric), 
+    .estimate = round(.estimate, 4)
+  )
+
+metrics_tbl
+
+results_df <- predict(final_fit, test) |>
+  rename(predicted_prosperity_score = .pred) |>
+  bind_cols(test |> select(county, prosperity_score)) |>
+  select(county, prosperity_score, predicted_prosperity_score) |>
+  mutate(
+    difference = predicted_prosperity_score - prosperity_score
+  )
+```
+
+
+
+```{r}
+final_csv <- afford_df |> 
+  mutate(highFood = .3 * food_cost,
+         low_transport = -.1 * transportation_cost,
+         preExistingHealth = .2 * healthcare_cost) |> 
+  select(-median_family_income, -case_id, -areaname) |> 
+  filter(family_member_count != "1p4c" & family_member_count != "2p4c") |> 
+  mutate(
+    YYY = total_cost + highFood + low_transport + preExistingHealth,
+    YYN = total_cost + highFood + low_transport,
+    YNY = total_cost + highFood + preExistingHealth,
+    NYY = total_cost + low_transport + preExistingHealth,
+    YNN = total_cost + highFood,
+    NYN = total_cost + low_transport,
+    NNY = total_cost + preExistingHealth,
+    NNN = total_cost
+  ) |> 
+  select(state, county, isMetro, family_member_count, YYY, YYN, YNY, NYY, YNN, NYN, NNY, NNN) |> 
+  mutate(
+    numKids = substr(family_member_count, 3, 3),
+    numAdults = substr(family_member_count, 1, 1)
+  ) |> 
+  select(-family_member_count) |>
+  pivot_longer(
+    cols = c(YYY, YYN, YNY, NYY, YNN, NYN, NNY, NNN),
+    names_to   = c("HighFood", "LowTransportation", "HighHealthConditions"),
+    names_pattern = "(.)(.)(.)",
+    values_to  = "Value"
+  ) |> 
+  group_by(numKids, numAdults, HighFood, LowTransportation, HighHealthConditions) |> 
+  mutate(
+    affordability_score = (Value - mean(Value, na.rm = TRUE)) / sd(Value, na.rm = TRUE)
+  ) |> 
+  ungroup() |> 
+  select(-Value)
+
+final_csv <- final_csv |> 
+  mutate(
+    county_combined = str_replace(county, "(?i)\\s+(c|ci|cit)$", " city"),
+    county_combined = str_remove(county_combined, "\\s+(County|Count|Coun|Cou|Co|C|P|Pa|Par|Pari|Paris|Parish)$"),
+    county_combined = paste(county_combined, state)
+  ) |> 
+  select(-county) |> 
+  rename(county = county_combined) |> 
+  left_join(prosperity_scores, by = "county") |>
+  select(-state) |> 
+  select(county, isMetro, numKids, numAdults, HighFood, LowTransportation, HighHealthConditions, affordability_score, prosperity_score)
+
+write_csv(final_csv, "affordabilityScores.csv")
+```
+
+
+
+
